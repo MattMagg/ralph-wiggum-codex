@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+subcommand="${1:-}"
+if [[ -z "$subcommand" ]]; then
+  echo "codex stub requires a subcommand" >&2
+  exit 2
+fi
+shift || true
+
+if [[ "$subcommand" != "exec" ]]; then
+  echo "codex stub supports only 'exec'" >&2
+  exit 2
+fi
+
+scenario="${CODEX_STUB_SCENARIO:-schema_complete_change}"
+state_dir="${CODEX_STUB_STATE_DIR:-$(mktemp -d)}"
+mkdir -p "$state_dir"
+count_file="$state_dir/call-count"
+call_count=0
+if [[ -f "$count_file" ]]; then
+  call_count="$(cat "$count_file")"
+fi
+call_count=$((call_count + 1))
+printf '%s\n' "$call_count" > "$count_file"
+
+cwd=""
+output_last_message=""
+prompt=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -C|--cd)
+      cwd="${2:-}"
+      shift 2
+      ;;
+    -o|--output-last-message)
+      output_last_message="${2:-}"
+      shift 2
+      ;;
+    --output-schema)
+      shift 2
+      ;;
+    --json|--experimental-json|--full-auto|--dangerously-bypass-approvals-and-sandbox|--yolo)
+      shift
+      ;;
+    --sandbox|--model|--profile)
+      shift 2
+      ;;
+    --*)
+      if [[ $# -gt 1 && ! "${2}" =~ ^- ]]; then
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    *)
+      prompt="$1"
+      shift
+      ;;
+  esac
+done
+
+write_last_message() {
+  local payload="$1"
+  if [[ -n "$output_last_message" ]]; then
+    printf '%s\n' "$payload" > "$output_last_message"
+  fi
+}
+
+touch_progress_file() {
+  if [[ -n "$cwd" ]]; then
+    printf 'progress %s\n' "$(date -u +%s)" > "$cwd/progress.txt"
+  fi
+}
+
+emit_json_event() {
+  local text="$1"
+  printf '{"type":"item.completed","item":{"type":"agent_message","text":%q}}\n' "$text"
+}
+
+completion_promise_value="${CODEX_STUB_COMPLETION_PROMISE:-DONE}"
+
+case "$scenario" in
+  schema_complete_change)
+    emit_json_event "complete"
+    touch_progress_file
+    write_last_message "{\"status\":\"COMPLETE\",\"evidence\":[\"implemented change\"],\"next_step\":\"NONE\",\"completion_promise\":\"$completion_promise_value\"}"
+    exit 0
+    ;;
+  schema_complete_nochange)
+    emit_json_event "complete without change"
+    write_last_message "{\"status\":\"COMPLETE\",\"evidence\":[\"reviewed constraints\"],\"next_step\":\"NONE\",\"completion_promise\":\"$completion_promise_value\"}"
+    exit 0
+    ;;
+  schema_complete_nochange_justified)
+    emit_json_event "complete with no-change justification"
+    write_last_message "{\"status\":\"COMPLETE\",\"evidence\":[\"no edits required\"],\"next_step\":\"NONE\",\"no_change_justification\":\"Repository already satisfied objective\",\"completion_promise\":\"$completion_promise_value\"}"
+    exit 0
+    ;;
+  schema_in_progress)
+    emit_json_event "in progress"
+    touch_progress_file
+    write_last_message "{\"status\":\"IN_PROGRESS\",\"evidence\":[\"partial implementation\"],\"next_step\":\"Finish tests\"}"
+    exit 0
+    ;;
+  invalid_json)
+    emit_json_event "invalid"
+    write_last_message "not-json"
+    exit 0
+    ;;
+  always_timeout)
+    sleep "${CODEX_STUB_TIMEOUT_SLEEP:-30}"
+    exit 0
+    ;;
+  timeout_then_complete)
+    if [[ "$call_count" -eq 1 ]]; then
+      sleep "${CODEX_STUB_TIMEOUT_SLEEP:-30}"
+      exit 0
+    fi
+    emit_json_event "complete after retry"
+    touch_progress_file
+    write_last_message "{\"status\":\"COMPLETE\",\"evidence\":[\"retried and completed\"],\"next_step\":\"NONE\",\"completion_promise\":\"$completion_promise_value\"}"
+    exit 0
+    ;;
+  *)
+    echo "Unknown CODEX_STUB_SCENARIO: $scenario" >&2
+    exit 3
+    ;;
+esac
+
+# Keep shellcheck satisfied about prompt potentially unused.
+if [[ -n "$prompt" ]]; then
+  :
+fi

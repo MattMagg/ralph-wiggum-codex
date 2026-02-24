@@ -15,7 +15,7 @@ The loop runner script is an internal execution engine for the skill, not the pr
 Use this skill when:
 - The task is unlikely to finish in one turn.
 - You need repeated implement -> validate -> refine cycles.
-- You want strict completion signaling (`<promise>...</promise>`) and resumable state.
+- You want schema-based completion signaling with resumable state.
 - You need unattended or semi-attended long-running execution with drift resistance.
 
 Do not use this skill when:
@@ -31,8 +31,9 @@ When this skill is invoked, execute this flow:
 - `cwd`
 - Objective text
 - Validation commands (fastest checks first)
-- Completion promise (if strict completion is required)
-- Runtime caps (`max-iterations`, `max-stagnant-iterations`)
+- Progress scopes (`--progress-scope`) for meaningful edits
+- Runtime caps (`max-iterations`, `max-stagnant-iterations`, timeout settings)
+- Completion promise only if compatibility mode is required (deprecated)
 
 2. Prepare loop files under `<cwd>/.codex/ralph-loop/`:
 - `objective.md` (objective to reload every iteration)
@@ -54,6 +55,10 @@ When this skill is invoked, execute this flow:
   --completion-promise "DONE" \
   --max-iterations 40 \
   --max-stagnant-iterations 6 \
+  --progress-scope "src/" \
+  --idle-timeout-seconds 900 \
+  --hard-timeout-seconds 7200 \
+  --timeout-retries 1 \
   --validate-cmd "npm run lint" \
   --validate-cmd "npm run test"
 ```
@@ -66,29 +71,40 @@ The runner supports long-running autonomy with iterative correction:
 - Auto-generated corrective feedback when codex/validation fails (`auto-feedback.md`)
 - Iteration memory (`iteration-history.md`) injected into future prompts
 - Stagnation detection (`--max-stagnant-iterations`)
-- Resumable state and lock-based single-run protection
+- Scoped no-op prevention (`--progress-scope` + `no_change_justification`)
+- Default-on watchdog timeouts with controlled retries
+- Resumable state and lock-based single-run protection with stale lock recovery
 
 ## Output Contract
 
-If `--completion-promise` is set, completion is accepted only when model output is exactly:
+Completion is accepted when all of the following are true:
+- `codex exec` output conforms to `.codex/ralph-loop/completion-schema.json`
+- `status` is `COMPLETE`
+- Validation commands pass
+- Scoped progress gate passes (or includes `no_change_justification`)
+- If compatibility mode is enabled, `completion_promise` equals `--completion-promise`
 
-```xml
-<promise>YOUR_PROMISE</promise>
-```
-
-Any extra text invalidates completion. If validations fail, completion is rejected and the loop continues.
+Schema fields:
+- `status`: `IN_PROGRESS`, `BLOCKED`, `COMPLETE`
+- `evidence`: non-empty array of concrete evidence
+- `next_step`: one highest-impact next step
+- `no_change_justification`: optional
+- `completion_promise`: optional compatibility field
 
 ## Core Files
 
 - `.codex/ralph-loop/state.env`
 - `.codex/ralph-loop/prompt.txt`
 - `.codex/ralph-loop/events.log`
+- `.codex/ralph-loop/completion-schema.json`
 - `.codex/ralph-loop/iteration-history.md`
 - `.codex/ralph-loop/feedback.md`
 - `.codex/ralph-loop/auto-feedback.md`
 - `.codex/ralph-loop/last-message.txt`
 - `.codex/ralph-loop/run-summary.md`
 - `.codex/ralph-loop/validation/`
+- `.codex/ralph-loop/codex/iteration-<n>-attempt-<m>.jsonl`
+- `.codex/ralph-loop/.lock/meta.env` (while active)
 
 ## Resume And Stop
 

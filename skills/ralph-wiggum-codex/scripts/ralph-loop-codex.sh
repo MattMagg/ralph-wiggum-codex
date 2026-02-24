@@ -5,6 +5,9 @@ SCRIPT_NAME="ralph-loop-codex.sh"
 DEFAULT_MAX_ITERATIONS=20
 DEFAULT_MAX_CONSECUTIVE_FAILURES=3
 DEFAULT_MAX_STAGNANT_ITERATIONS=6
+DEFAULT_IDLE_TIMEOUT_SECONDS=900
+DEFAULT_HARD_TIMEOUT_SECONDS=7200
+DEFAULT_TIMEOUT_RETRIES=1
 
 usage() {
   cat <<'USAGE'
@@ -26,7 +29,7 @@ Core options:
   --feedback-file <file>           Optional operator feedback file read each iteration
   --resume                          Resume from existing state in --state-dir
   --state-dir <dir>                State directory (default: <cwd>/.codex/ralph-loop)
-  --completion-promise <text>      Stop only when exact output is <promise>text</promise>
+  --completion-promise <text>      Deprecated compatibility completion token (checked in schema output)
   --max-iterations <n>             Stop after n iterations (default: 20, 0 = unbounded)
   --allow-unbounded                Allow infinite run only when max-iterations=0
   --max-consecutive-failures <n>   Stop after n consecutive codex failures (default: 3)
@@ -38,12 +41,17 @@ Harness and safety options:
   --source-of-truth <path-or-url>  File/URL that defines requirements (repeatable)
   --preflight-cmd <command>        Command to run once before loop starts (repeatable)
   --validate-cmd <command>         Command to run after each iteration (repeatable)
+  --progress-scope <pathspec>      Git pathspec used to measure scoped progress (repeatable, default: .)
   --stop-file <path>               Sentinel file that stops loop if present
+  --reclaim-stale-lock             Force reclaim existing lock even if metadata is missing/corrupt
 
 Codex execution options:
   --sandbox <mode>                 codex exec sandbox mode (read-only/workspace-write/danger-full-access)
   --model <model>                  Model override for codex exec
   --profile <profile>              Profile override for codex exec
+  --idle-timeout-seconds <n>       Kill codex exec when JSON stream is idle for n seconds (default: 900, 0=disabled)
+  --hard-timeout-seconds <n>       Kill codex exec when total runtime exceeds n seconds (default: 7200, 0=disabled)
+  --timeout-retries <n>            Retry timeout-killed codex exec attempts n times (default: 1)
   --full-auto                      Pass --full-auto to codex exec
   --dangerous                      Pass --dangerously-bypass-approvals-and-sandbox to codex exec
   --codex-arg <arg>                Additional argument passed to codex exec (repeatable)
@@ -93,11 +101,14 @@ trim_ws() {
 
 read_lines_file() {
   local file_path="$1"
-  local -n out_arr="$2"
-  out_arr=()
+  local out_var="$2"
+  eval "$out_var=()"
   if [[ -f "$file_path" ]]; then
     while IFS= read -r line; do
-      [[ -n "$line" ]] && out_arr+=("$line")
+      [[ -n "$line" ]] || continue
+      local quoted_line
+      printf -v quoted_line '%q' "$line"
+      eval "$out_var+=($quoted_line)"
     done < "$file_path"
   fi
 }
@@ -113,6 +124,26 @@ write_lines_file() {
   done
 }
 
+write_lines_file_from_array() {
+  local file_path="$1"
+  local array_name="$2"
+  : > "$file_path"
+
+  local array_len=0
+  eval "array_len=\${#$array_name[@]}"
+  if [[ "$array_len" -eq 0 ]]; then
+    return
+  fi
+
+  local idx=0
+  local item=""
+  for ((idx=0; idx<array_len; idx++)); do
+    eval "item=\${$array_name[$idx]}"
+    [[ -n "$item" ]] || continue
+    printf '%s\n' "$item" >> "$file_path"
+  done
+}
+
 run_id=""
 cwd=""
 state_dir=""
@@ -123,12 +154,17 @@ auto_feedback_file=""
 validate_file=""
 preflight_file=""
 source_of_truth_file=""
+progress_scope_file=""
 codex_args_file=""
 events_file=""
 last_message_file=""
 summary_file=""
 stop_file=""
 lock_dir=""
+lock_meta_file=""
+completion_schema_file=""
+codex_log_dir=""
+state_dir_rel=""
 
 prompt=""
 prompt_file=""
@@ -143,18 +179,23 @@ sandbox=""
 model=""
 profile=""
 sleep_seconds=0
+idle_timeout_seconds="$DEFAULT_IDLE_TIMEOUT_SECONDS"
+hard_timeout_seconds="$DEFAULT_HARD_TIMEOUT_SECONDS"
+timeout_retries="$DEFAULT_TIMEOUT_RETRIES"
 
 resume=0
 allow_unbounded=0
 full_auto=0
 dangerous=0
 dry_run=0
+reclaim_stale_lock=0
 
 provided_max_iterations=0
 provided_completion_promise=0
 provided_validate=0
 provided_preflight=0
 provided_source_of_truth=0
+provided_progress_scope=0
 provided_codex_arg=0
 provided_autonomy=0
 provided_sandbox=0
@@ -162,10 +203,14 @@ provided_objective_file=0
 provided_feedback_file=0
 provided_max_stagnant_iterations=0
 provided_sleep_seconds=0
+provided_idle_timeout_seconds=0
+provided_hard_timeout_seconds=0
+provided_timeout_retries=0
 
 validate_cmds=()
 preflight_cmds=()
 source_of_truth=()
+progress_scopes=()
 codex_extra_args=()
 
 active=1
@@ -176,6 +221,14 @@ last_output_hash=""
 started_at=""
 last_event_at=""
 stop_reason=""
+is_git_repo=0
+schema_parse_status="ok"
+progress_status="pass"
+progress_changed=0
+no_change_justification=""
+completion_status_value=""
+completion_promise_value=""
+attempt_timeout_reason=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -229,6 +282,21 @@ while [[ $# -gt 0 ]]; do
       provided_sleep_seconds=1
       shift 2
       ;;
+    --idle-timeout-seconds)
+      idle_timeout_seconds="${2:-}"
+      provided_idle_timeout_seconds=1
+      shift 2
+      ;;
+    --hard-timeout-seconds)
+      hard_timeout_seconds="${2:-}"
+      provided_hard_timeout_seconds=1
+      shift 2
+      ;;
+    --timeout-retries)
+      timeout_retries="${2:-}"
+      provided_timeout_retries=1
+      shift 2
+      ;;
     --autonomy-level)
       autonomy_level="${2:-}"
       provided_autonomy=1
@@ -247,6 +315,11 @@ while [[ $# -gt 0 ]]; do
     --validate-cmd)
       validate_cmds+=("${2:-}")
       provided_validate=1
+      shift 2
+      ;;
+    --progress-scope)
+      progress_scopes+=("${2:-}")
+      provided_progress_scope=1
       shift 2
       ;;
     --sandbox)
@@ -291,6 +364,10 @@ while [[ $# -gt 0 ]]; do
       dry_run=1
       shift
       ;;
+    --reclaim-stale-lock)
+      reclaim_stale_lock=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -308,6 +385,12 @@ if [[ -z "$state_dir" ]]; then
   state_dir="$cwd/.codex/ralph-loop"
 fi
 
+if [[ "$state_dir" == "$cwd" ]]; then
+  state_dir_rel="."
+elif [[ "$state_dir" == "$cwd/"* ]]; then
+  state_dir_rel="${state_dir#$cwd/}"
+fi
+
 state_file="$state_dir/state.env"
 prompt_file_saved="$state_dir/prompt.txt"
 history_file="$state_dir/iteration-history.md"
@@ -315,10 +398,13 @@ auto_feedback_file="$state_dir/auto-feedback.md"
 validate_file="$state_dir/validate-cmds.txt"
 preflight_file="$state_dir/preflight-cmds.txt"
 source_of_truth_file="$state_dir/source-of-truth.txt"
+progress_scope_file="$state_dir/progress-scopes.txt"
 codex_args_file="$state_dir/codex-args.txt"
 events_file="$state_dir/events.log"
 last_message_file="$state_dir/last-message.txt"
 summary_file="$state_dir/run-summary.md"
+completion_schema_file="$state_dir/completion-schema.json"
+codex_log_dir="$state_dir/codex"
 
 if [[ -z "$stop_file" ]]; then
   stop_file="$state_dir/STOP"
@@ -329,6 +415,7 @@ if [[ -z "$feedback_file" ]]; then
 fi
 
 lock_dir="$state_dir/.lock"
+lock_meta_file="$lock_dir/meta.env"
 
 case "$autonomy_level" in
   l0|l1|l2|l3)
@@ -352,6 +439,18 @@ fi
 
 if ! [[ "$sleep_seconds" =~ ^[0-9]+$ ]]; then
   die "--sleep-seconds must be an integer >= 0"
+fi
+
+if ! [[ "$idle_timeout_seconds" =~ ^[0-9]+$ ]]; then
+  die "--idle-timeout-seconds must be an integer >= 0"
+fi
+
+if ! [[ "$hard_timeout_seconds" =~ ^[0-9]+$ ]]; then
+  die "--hard-timeout-seconds must be an integer >= 0"
+fi
+
+if ! [[ "$timeout_retries" =~ ^[0-9]+$ ]]; then
+  die "--timeout-retries must be an integer >= 0"
 fi
 
 if [[ "$resume" -eq 1 ]]; then
@@ -398,6 +497,18 @@ if [[ "$resume" -eq 1 ]]; then
     sleep_seconds="${SLEEP_SECONDS:-0}"
   fi
 
+  if [[ "$provided_idle_timeout_seconds" -eq 0 ]]; then
+    idle_timeout_seconds="${IDLE_TIMEOUT_SECONDS:-$DEFAULT_IDLE_TIMEOUT_SECONDS}"
+  fi
+
+  if [[ "$provided_hard_timeout_seconds" -eq 0 ]]; then
+    hard_timeout_seconds="${HARD_TIMEOUT_SECONDS:-$DEFAULT_HARD_TIMEOUT_SECONDS}"
+  fi
+
+  if [[ "$provided_timeout_retries" -eq 0 ]]; then
+    timeout_retries="${TIMEOUT_RETRIES:-$DEFAULT_TIMEOUT_RETRIES}"
+  fi
+
   if [[ -z "$model" ]]; then
     model="${MODEL:-}"
   fi
@@ -422,8 +533,15 @@ if [[ "$resume" -eq 1 ]]; then
   if [[ "$provided_source_of_truth" -eq 0 ]]; then
     read_lines_file "$source_of_truth_file" source_of_truth
   fi
+  if [[ "$provided_progress_scope" -eq 0 ]]; then
+    read_lines_file "$progress_scope_file" progress_scopes
+  fi
   if [[ "$provided_codex_arg" -eq 0 ]]; then
     read_lines_file "$codex_args_file" codex_extra_args
+  fi
+
+  if [[ ${#progress_scopes[@]} -eq 0 ]]; then
+    progress_scopes=(".")
   fi
 
   note "Resuming run: $run_id (starting at iteration $iteration)"
@@ -450,8 +568,12 @@ else
     esac
   fi
 
-  if [[ "$max_iterations" -eq 0 && -z "$completion_promise" && "$allow_unbounded" -ne 1 ]]; then
-    die "Unbounded loop requires either --completion-promise or --allow-unbounded"
+  if [[ "$max_iterations" -eq 0 && "$allow_unbounded" -ne 1 ]]; then
+    die "Unbounded loop requires --allow-unbounded"
+  fi
+
+  if [[ ${#progress_scopes[@]} -eq 0 ]]; then
+    progress_scopes=(".")
   fi
 
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -463,15 +585,62 @@ else
 fi
 
 mkdir -p "$state_dir"
+mkdir -p "$codex_log_dir"
+
+lock_pid_from_meta() {
+  local meta_file="$1"
+  [[ -f "$meta_file" ]] || return 1
+  local pid_line
+  pid_line="$(grep '^PID=' "$meta_file" | tail -n 1 || true)"
+  [[ -n "$pid_line" ]] || return 1
+  local pid="${pid_line#PID=}"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$pid"
+}
+
+is_pid_alive() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+reclaim_existing_lock_if_stale() {
+  [[ -d "$lock_dir" ]] || return 0
+
+  local lock_pid=""
+  if lock_pid="$(lock_pid_from_meta "$lock_meta_file")"; then
+    if is_pid_alive "$lock_pid"; then
+      die "Another loop is already active (lock exists: $lock_dir, pid=$lock_pid)"
+    fi
+    warn "Reclaiming stale lock (dead pid=$lock_pid): $lock_dir"
+    rm -rf "$lock_dir"
+    return 0
+  fi
+
+  if [[ "$reclaim_stale_lock" -eq 1 ]]; then
+    warn "Reclaiming lock with invalid metadata (--reclaim-stale-lock): $lock_dir"
+    rm -rf "$lock_dir"
+    return 0
+  fi
+
+  die "Lock exists with invalid metadata ($lock_meta_file). Use --reclaim-stale-lock to force reclaim."
+}
+
+reclaim_existing_lock_if_stale
 
 if mkdir "$lock_dir" 2>/dev/null; then
-  :
+  cat > "$lock_meta_file" <<EOF_LOCK
+PID=$$
+RUN_ID=$(printf '%q' "$run_id")
+STARTED_AT=$(printf '%q' "$started_at")
+CWD=$(printf '%q' "$cwd")
+EOF_LOCK
 else
   die "Another loop is already active (lock exists: $lock_dir)"
 fi
 
 cleanup_lock() {
-  rmdir "$lock_dir" 2>/dev/null || true
+  rm -rf "$lock_dir" 2>/dev/null || true
 }
 trap cleanup_lock EXIT
 
@@ -482,6 +651,37 @@ log_event() {
   ts="$(now_utc)"
   last_event_at="$ts"
   printf '%s\titeration=%s\tevent=%s\tdetail=%s\n' "$ts" "$iteration" "$event" "$detail" >> "$events_file"
+}
+
+write_completion_schema() {
+  cat > "$completion_schema_file" <<'EOF_SCHEMA'
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["IN_PROGRESS", "BLOCKED", "COMPLETE"]
+    },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "next_step": {
+      "type": "string",
+      "minLength": 1
+    },
+    "no_change_justification": {
+      "type": "string"
+    },
+    "completion_promise": {
+      "type": "string"
+    }
+  },
+  "required": ["status", "evidence", "next_step"],
+  "additionalProperties": false
+}
+EOF_SCHEMA
 }
 
 save_state() {
@@ -508,6 +708,9 @@ COMPLETION_PROMISE_B64=$(printf '%q' "$promise_b64")
 OBJECTIVE_FILE=$(printf '%q' "$objective_file")
 FEEDBACK_FILE=$(printf '%q' "$feedback_file")
 SLEEP_SECONDS=$sleep_seconds
+IDLE_TIMEOUT_SECONDS=$idle_timeout_seconds
+HARD_TIMEOUT_SECONDS=$hard_timeout_seconds
+TIMEOUT_RETRIES=$timeout_retries
 EOF_STATE
 }
 
@@ -541,13 +744,20 @@ write_summary() {
 - Max consecutive failures: $max_consecutive_failures
 - Max stagnant iterations: $max_stagnant_iterations
 - Sleep seconds: $sleep_seconds
+- Idle timeout seconds: $idle_timeout_seconds
+- Hard timeout seconds: $hard_timeout_seconds
+- Timeout retries: $timeout_retries
 - Objective file: ${objective_file:-"(none)"}
+- Completion schema: $completion_schema_file
 
 ## Validation commands
 $(if [[ ${#validate_cmds[@]} -eq 0 ]]; then echo '- (none)'; else printf -- '- `%s`\n' "${validate_cmds[@]}"; fi)
 
 ## Source of truth
 $(if [[ ${#source_of_truth[@]} -eq 0 ]]; then echo '- (none)'; else printf -- '- `%s`\n' "${source_of_truth[@]}"; fi)
+
+## Progress scopes
+$(if [[ ${#progress_scopes[@]} -eq 0 ]]; then echo '- (none)'; else printf -- '- `%s`\n' "${progress_scopes[@]}"; fi)
 EOF_SUMMARY
 }
 
@@ -571,6 +781,18 @@ build_validation_block() {
 
   local item
   for item in "${validate_cmds[@]}"; do
+    printf -- '- %s\n' "$item"
+  done
+}
+
+build_progress_scope_block() {
+  if [[ ${#progress_scopes[@]} -eq 0 ]]; then
+    printf '%s\n' '- (none declared)'
+    return
+  fi
+
+  local item
+  for item in "${progress_scopes[@]}"; do
     printf -- '- %s\n' "$item"
   done
 }
@@ -634,12 +856,15 @@ append_iteration_history() {
   local codex_status="$1"
   local validation_status="$2"
   local completion_status="$3"
+  local parse_status="$4"
+  local progress_gate_status="$5"
 
   {
     printf '%s\n' '---'
-    printf 'iteration=%s timestamp=%s codex_exit=%s validation=%s completion=%s stagnant=%s\n' \
-      "$iteration" "$(now_utc)" "$codex_status" "$validation_status" "$completion_status" "$stagnant_iterations"
+    printf 'iteration=%s timestamp=%s codex_exit=%s validation=%s completion=%s parse=%s progress=%s stagnant=%s\n' \
+      "$iteration" "$(now_utc)" "$codex_status" "$validation_status" "$completion_status" "$parse_status" "$progress_gate_status" "$stagnant_iterations"
     printf 'objective_file=%s feedback_file=%s\n' "${objective_file:-"(none)"}" "$feedback_file"
+    printf 'completion_status_value=%s no_change_justification=%s\n' "${completion_status_value:-"(none)"}" "${no_change_justification:-"(none)"}"
     printf 'last_message_tail:\n'
     if [[ -f "$last_message_file" ]]; then
       tail -n 60 "$last_message_file"
@@ -654,6 +879,8 @@ refresh_auto_feedback() {
   local codex_status="$1"
   local validation_status="$2"
   local completion_status="$3"
+  local parse_status="$4"
+  local progress_gate_status="$5"
 
   if [[ "$completion_status" == "yes" ]]; then
     rm -f "$auto_feedback_file"
@@ -670,12 +897,31 @@ EOF_AUTO
     return
   fi
 
+  if [[ "$parse_status" != "ok" ]]; then
+    cat > "$auto_feedback_file" <<EOF_AUTO
+Completion output did not match the expected JSON contract in iteration $iteration.
+- Expected schema file: .codex/ralph-loop/completion-schema.json
+- Ensure output includes status/evidence/next_step fields.
+- Keep evidence concrete and avoid prose outside the JSON object.
+EOF_AUTO
+    return
+  fi
+
   if [[ "$validation_status" != "pass" ]]; then
     cat > "$auto_feedback_file" <<EOF_AUTO
 Validation failed in iteration $iteration.
 - Inspect .codex/ralph-loop/validation/iteration-$iteration/ logs.
 - Fix failing checks before claiming completion.
 - Prefer the smallest concrete change that turns checks green.
+EOF_AUTO
+    return
+  fi
+
+  if [[ "$progress_gate_status" == "no_change_unjustified" ]]; then
+    cat > "$auto_feedback_file" <<EOF_AUTO
+No scoped progress detected in iteration $iteration.
+- Edit files under the configured progress scopes or provide no_change_justification.
+- If no edit is required, explain why in no_change_justification.
 EOF_AUTO
     return
   fi
@@ -698,44 +944,228 @@ run_cmd_in_cwd() {
   )
 }
 
+scoped_status_hash() {
+  if [[ "$is_git_repo" -ne 1 ]]; then
+    printf '%s' "not-git"
+    return 0
+  fi
+
+  local status_output=""
+  if ! status_output="$(git -C "$cwd" status --porcelain -- "${progress_scopes[@]}")"; then
+    die "Failed to compute progress scope status for: ${progress_scopes[*]}"
+  fi
+
+  if [[ -n "$state_dir_rel" && "$state_dir_rel" != "." ]]; then
+    local filtered_lines=()
+    local line=""
+    local path=""
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      path="${line:3}"
+      path="${path#\"}"
+      path="${path%\"}"
+      if [[ "$path" == "$state_dir_rel" || "$path" == "$state_dir_rel/"* ]]; then
+        continue
+      fi
+      filtered_lines+=("$line")
+    done <<< "$status_output"
+    if [[ ${#filtered_lines[@]} -eq 0 ]]; then
+      status_output=""
+    else
+      status_output="$(printf '%s\n' "${filtered_lines[@]}")"
+    fi
+  fi
+
+  printf '%s' "$status_output" | hash_text
+}
+
+parse_completion_message_json() {
+  local message_file="$1"
+  completion_status_value=""
+  no_change_justification=""
+  completion_promise_value=""
+
+  if [[ ! -f "$message_file" ]]; then
+    schema_parse_status="missing_file"
+    return 1
+  fi
+
+  local parse_output=""
+  if ! parse_output="$(
+    python3 - "$message_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        payload = fh.read().strip()
+    if not payload:
+        raise ValueError("empty final message")
+    data = json.loads(payload)
+    status = data.get("status")
+    evidence = data.get("evidence")
+    next_step = data.get("next_step")
+    if status not in {"IN_PROGRESS", "BLOCKED", "COMPLETE"}:
+        raise ValueError("status must be IN_PROGRESS|BLOCKED|COMPLETE")
+    if not isinstance(evidence, list) or not evidence:
+        raise ValueError("evidence must be a non-empty array")
+    if any((not isinstance(item, str) or not item.strip()) for item in evidence):
+        raise ValueError("each evidence item must be a non-empty string")
+    if not isinstance(next_step, str) or not next_step.strip():
+        raise ValueError("next_step must be a non-empty string")
+
+    no_change = data.get("no_change_justification", "")
+    if no_change is None:
+        no_change = ""
+    if not isinstance(no_change, str):
+        raise ValueError("no_change_justification must be a string when present")
+
+    promise = data.get("completion_promise", "")
+    if promise is None:
+        promise = ""
+    if not isinstance(promise, str):
+        raise ValueError("completion_promise must be a string when present")
+
+    clean_status = status.replace("|", " ").strip()
+    clean_no_change = no_change.replace("|", " ").strip()
+    clean_promise = promise.replace("|", " ").strip()
+    print(f"{clean_status}|{clean_no_change}|{clean_promise}")
+except Exception as exc:
+    print(f"ERROR:{exc}")
+    sys.exit(1)
+PY
+  )"; then
+    schema_parse_status="invalid_json_contract"
+    return 1
+  fi
+
+  IFS='|' read -r completion_status_value no_change_justification completion_promise_value <<< "$parse_output"
+  schema_parse_status="ok"
+  return 0
+}
+
+run_codex_exec_with_watchdog() {
+  local local_prompt="$1"
+  local attempt="$2"
+  local attempt_jsonl="$codex_log_dir/iteration-${iteration}-attempt-${attempt}.jsonl"
+  local attempt_stderr="$codex_log_dir/iteration-${iteration}-attempt-${attempt}.stderr.log"
+  local codex_cmd=()
+
+  codex_cmd=(codex exec -C "$cwd" --output-last-message "$last_message_file" --output-schema "$completion_schema_file" --json)
+
+  [[ -n "$sandbox" ]] && codex_cmd+=(--sandbox "$sandbox")
+  [[ -n "$model" ]] && codex_cmd+=(--model "$model")
+  [[ -n "$profile" ]] && codex_cmd+=(--profile "$profile")
+  [[ "$full_auto" -eq 1 ]] && codex_cmd+=(--full-auto)
+  [[ "$dangerous" -eq 1 ]] && codex_cmd+=(--dangerously-bypass-approvals-and-sandbox)
+
+  if [[ ${#codex_extra_args[@]} -gt 0 ]]; then
+    codex_cmd+=("${codex_extra_args[@]}")
+  fi
+
+  codex_cmd+=("$local_prompt")
+
+  : > "$attempt_jsonl"
+  : > "$attempt_stderr"
+  log_event "codex_attempt_start" "attempt=$attempt;jsonl=$attempt_jsonl"
+
+  "${codex_cmd[@]}" >"$attempt_jsonl" 2>"$attempt_stderr" &
+  local codex_pid=$!
+  local start_ts
+  start_ts="$(date +%s)"
+  local last_activity_ts="$start_ts"
+  local last_size=-1
+  local now_ts=0
+
+  attempt_timeout_reason=""
+  while kill -0 "$codex_pid" 2>/dev/null; do
+    sleep 1
+    local current_size=0
+    current_size="$(wc -c < "$attempt_jsonl" 2>/dev/null || echo 0)"
+    if [[ "$current_size" -ne "$last_size" ]]; then
+      last_size="$current_size"
+      last_activity_ts="$(date +%s)"
+    fi
+
+    now_ts="$(date +%s)"
+    if [[ "$hard_timeout_seconds" -gt 0 ]] && [[ $((now_ts - start_ts)) -ge "$hard_timeout_seconds" ]]; then
+      attempt_timeout_reason="hard_timeout"
+      break
+    fi
+    if [[ "$idle_timeout_seconds" -gt 0 ]] && [[ $((now_ts - last_activity_ts)) -ge "$idle_timeout_seconds" ]]; then
+      attempt_timeout_reason="idle_timeout"
+      break
+    fi
+  done
+
+  if [[ -n "$attempt_timeout_reason" ]]; then
+    warn "codex exec timed out (reason=$attempt_timeout_reason, attempt=$attempt)"
+    log_event "codex_timeout" "attempt=$attempt;reason=$attempt_timeout_reason;jsonl=$attempt_jsonl"
+    kill -- -"$codex_pid" 2>/dev/null || kill "$codex_pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$codex_pid" 2>/dev/null || true
+    wait "$codex_pid" 2>/dev/null || true
+    return 124
+  fi
+
+  local cmd_status=0
+  set +e
+  wait "$codex_pid"
+  cmd_status=$?
+  set -e
+  log_event "codex_attempt_end" "attempt=$attempt;exit=$cmd_status;jsonl=$attempt_jsonl"
+  return "$cmd_status"
+}
+
 run_preflight() {
   command -v codex >/dev/null 2>&1 || die "codex CLI not found in PATH"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required to parse schema output"
 
   if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    is_git_repo=1
     local dirty_count
     dirty_count="$(git -C "$cwd" status --porcelain | wc -l | tr -d ' ')"
+    if ! git -C "$cwd" status --porcelain -- "${progress_scopes[@]}" >/dev/null 2>&1; then
+      die "Invalid --progress-scope pathspec list: ${progress_scopes[*]}"
+    fi
     note "Git working tree detected; uncommitted entries: $dirty_count"
     log_event "preflight_git" "dirty_entries=$dirty_count"
   else
+    is_git_repo=0
     warn "Working directory is not a git repository"
     log_event "preflight_git" "not_a_repo"
   fi
 
-  local source
-  for source in "${source_of_truth[@]}"; do
-    if [[ "$source" =~ ^https?:// ]]; then
-      continue
-    fi
+  if [[ ${#source_of_truth[@]} -gt 0 ]]; then
+    local source
+    for source in "${source_of_truth[@]}"; do
+      if [[ "$source" =~ ^https?:// ]]; then
+        continue
+      fi
 
-    if [[ -e "$source" || -e "$cwd/$source" ]]; then
-      continue
-    fi
+      if [[ -e "$source" || -e "$cwd/$source" ]]; then
+        continue
+      fi
 
-    die "Source-of-truth path not found: $source"
-  done
+      die "Source-of-truth path not found: $source"
+    done
+  fi
 
-  local idx=0
-  local cmd
-  for cmd in "${preflight_cmds[@]}"; do
-    idx=$((idx + 1))
-    note "Preflight [$idx/${#preflight_cmds[@]}]: $cmd"
-    if run_cmd_in_cwd "$cmd"; then
-      log_event "preflight_ok" "$cmd"
-    else
-      log_event "preflight_fail" "$cmd"
-      die "Preflight command failed: $cmd"
-    fi
-  done
+  if [[ ${#preflight_cmds[@]} -gt 0 ]]; then
+    local idx=0
+    local cmd
+    for cmd in "${preflight_cmds[@]}"; do
+      idx=$((idx + 1))
+      note "Preflight [$idx/${#preflight_cmds[@]}]: $cmd"
+      if run_cmd_in_cwd "$cmd"; then
+        log_event "preflight_ok" "$cmd"
+      else
+        log_event "preflight_fail" "$cmd"
+        die "Preflight command failed: $cmd"
+      fi
+    done
+  fi
 }
 
 run_validation_loop() {
@@ -743,21 +1173,23 @@ run_validation_loop() {
   mkdir -p "$validation_dir"
 
   local failed=0
-  local idx=0
-  local cmd
-  for cmd in "${validate_cmds[@]}"; do
-    idx=$((idx + 1))
-    local log_file="$validation_dir/cmd-$idx.log"
-    note "Validation [$idx/${#validate_cmds[@]}]: $cmd"
+  if [[ ${#validate_cmds[@]} -gt 0 ]]; then
+    local idx=0
+    local cmd
+    for cmd in "${validate_cmds[@]}"; do
+      idx=$((idx + 1))
+      local log_file="$validation_dir/cmd-$idx.log"
+      note "Validation [$idx/${#validate_cmds[@]}]: $cmd"
 
-    if run_cmd_in_cwd "$cmd" >"$log_file" 2>&1; then
-      log_event "validation_ok" "cmd=$cmd;log=$log_file"
-    else
-      failed=1
-      warn "Validation failed: $cmd (see $log_file)"
-      log_event "validation_fail" "cmd=$cmd;log=$log_file"
-    fi
-  done
+      if run_cmd_in_cwd "$cmd" >"$log_file" 2>&1; then
+        log_event "validation_ok" "cmd=$cmd;log=$log_file"
+      else
+        failed=1
+        warn "Validation failed: $cmd (see $log_file)"
+        log_event "validation_fail" "cmd=$cmd;log=$log_file"
+      fi
+    done
+  fi
 
   return "$failed"
 }
@@ -775,12 +1207,8 @@ build_iteration_prompt() {
   local recent_history_block
   recent_history_block="$(build_recent_history_block)"
 
-  local completion_contract
-  if [[ -n "$completion_promise" ]]; then
-    completion_contract="- If and only if all requirements are satisfied and validations pass, respond with EXACTLY: <promise>$completion_promise</promise>"
-  else
-    completion_contract="- Do not emit <promise> tags; continue with concrete progress updates"
-  fi
+  local progress_scope_block
+  progress_scope_block="$(build_progress_scope_block)"
 
   cat <<EOF_PROMPT
 Ralph Loop for Codex
@@ -803,6 +1231,9 @@ Operating invariants:
 Validation loop:
 $validation_block
 
+Progress scopes (required change surface):
+$progress_scope_block
+
 Recent iteration memory:
 $recent_history_block
 
@@ -810,13 +1241,14 @@ Feedback updates:
 $feedback_block
 
 Output contract:
-$completion_contract
-- If not complete, include:
-  Status: IN_PROGRESS or BLOCKED
-  Evidence:
-  - command/result pairs from this iteration
-  Next:
-  - exactly one highest-impact next step
+- Respond with EXACTLY one JSON object matching completion-schema.json.
+- Fields:
+  status: IN_PROGRESS | BLOCKED | COMPLETE
+  evidence: non-empty array of concrete command/result evidence from this iteration
+  next_step: exactly one highest-impact next step
+  no_change_justification: optional, required when no scoped files changed
+  completion_promise: optional compatibility field (required when configured as "$completion_promise" and status is COMPLETE)
+- Do not include any text outside the JSON object.
 EOF_PROMPT
 }
 
@@ -835,22 +1267,28 @@ max_iterations=$max_iterations
 max_consecutive_failures=$max_consecutive_failures
 max_stagnant_iterations=$max_stagnant_iterations
 sleep_seconds=$sleep_seconds
+idle_timeout_seconds=$idle_timeout_seconds
+hard_timeout_seconds=$hard_timeout_seconds
+timeout_retries=$timeout_retries
 completion_promise=${completion_promise:-"(none)"}
 stop_file=$stop_file
 objective_file=${objective_file:-"(none)"}
 feedback_file=$feedback_file
+completion_schema_file=$completion_schema_file
 
 source_of_truth_count=${#source_of_truth[@]}
+progress_scope_count=${#progress_scopes[@]}
 preflight_cmd_count=${#preflight_cmds[@]}
 validate_cmd_count=${#validate_cmds[@]}
 codex_extra_arg_count=${#codex_extra_args[@]}
 EOF_CONFIG
 }
 
-write_lines_file "$validate_file" "${validate_cmds[@]-}"
-write_lines_file "$preflight_file" "${preflight_cmds[@]-}"
-write_lines_file "$source_of_truth_file" "${source_of_truth[@]-}"
-write_lines_file "$codex_args_file" "${codex_extra_args[@]-}"
+write_lines_file_from_array "$validate_file" "validate_cmds"
+write_lines_file_from_array "$preflight_file" "preflight_cmds"
+write_lines_file_from_array "$source_of_truth_file" "source_of_truth"
+write_lines_file_from_array "$progress_scope_file" "progress_scopes"
+write_lines_file_from_array "$codex_args_file" "codex_extra_args"
 prompt="$(resolve_objective)"
 printf '%s\n' "$prompt" > "$prompt_file_saved"
 
@@ -867,6 +1305,12 @@ note "Stop file: $stop_file"
 log_event "loop_start" "autonomy=$autonomy_level;sandbox=$sandbox"
 
 run_preflight
+write_completion_schema
+
+if [[ -n "$completion_promise" ]]; then
+  warn "--completion-promise is deprecated; completion is now schema-based."
+  log_event "completion_promise_deprecated" "value=$completion_promise"
+fi
 
 active=1
 save_state
@@ -889,33 +1333,37 @@ while true; do
   local_prompt="$(build_iteration_prompt)"
   log_event "iteration_start" "iteration=$iteration"
 
-  codex_cmd=(codex exec -C "$cwd" --output-last-message "$last_message_file")
+  pre_scope_hash="$(scoped_status_hash)"
 
-  [[ -n "$sandbox" ]] && codex_cmd+=(--sandbox "$sandbox")
-  [[ -n "$model" ]] && codex_cmd+=(--model "$model")
-  [[ -n "$profile" ]] && codex_cmd+=(--profile "$profile")
-  [[ "$full_auto" -eq 1 ]] && codex_cmd+=(--full-auto)
-  [[ "$dangerous" -eq 1 ]] && codex_cmd+=(--dangerously-bypass-approvals-and-sandbox)
+  codex_exit=0
+  attempt=1
+  max_attempts=$((timeout_retries + 1))
+  while true; do
+    if run_codex_exec_with_watchdog "$local_prompt" "$attempt"; then
+      codex_exit=0
+      break
+    else
+      codex_exit=$?
+    fi
 
-  if [[ ${#codex_extra_args[@]} -gt 0 ]]; then
-    codex_cmd+=("${codex_extra_args[@]}")
-  fi
-
-  codex_cmd+=("$local_prompt")
-
-  set +e
-  "${codex_cmd[@]}"
-  codex_exit=$?
-  set -e
+    if [[ "$codex_exit" -eq 124 && "$attempt" -lt "$max_attempts" ]]; then
+      log_event "codex_timeout_retry" "attempt=$attempt;reason=${attempt_timeout_reason:-timeout}"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    break
+  done
 
   if [[ "$codex_exit" -ne 0 ]]; then
     validation_status="skipped"
     completion_status="no"
+    schema_parse_status="skipped"
+    progress_status="skipped"
     consecutive_failures=$((consecutive_failures + 1))
     warn "codex exec failed (exit=$codex_exit), consecutive failures=$consecutive_failures"
-    log_event "codex_fail" "exit=$codex_exit"
-    refresh_auto_feedback "$codex_exit" "$validation_status" "$completion_status"
-    append_iteration_history "$codex_exit" "$validation_status" "$completion_status"
+    log_event "codex_fail" "exit=$codex_exit;attempt=$attempt;reason=${attempt_timeout_reason:-none}"
+    refresh_auto_feedback "$codex_exit" "$validation_status" "$completion_status" "$schema_parse_status" "$progress_status"
+    append_iteration_history "$codex_exit" "$validation_status" "$completion_status" "$schema_parse_status" "$progress_status"
 
     if [[ "$consecutive_failures" -ge "$max_consecutive_failures" ]]; then
       stop_reason="max_consecutive_failures_reached"
@@ -931,6 +1379,13 @@ while true; do
 
   consecutive_failures=0
   log_event "codex_ok" "iteration=$iteration"
+
+  schema_parse_status="not_parsed"
+  progress_status="pass"
+  progress_changed=0
+  no_change_justification=""
+  completion_status_value=""
+  completion_promise_value=""
 
   validation_ok=1
   if [[ ${#validate_cmds[@]} -gt 0 ]]; then
@@ -948,24 +1403,52 @@ while true; do
 
   completion_detected=0
   completion_status="no"
+  if parse_completion_message_json "$last_message_file"; then
+    if [[ "$completion_status_value" == "COMPLETE" ]]; then
+      completion_detected=1
+      completion_status="yes"
+    fi
+  else
+    log_event "schema_parse_fail" "file=$last_message_file;status=$schema_parse_status"
+  fi
+
+  post_scope_hash="$(scoped_status_hash)"
+  if [[ "$is_git_repo" -eq 1 ]]; then
+    if [[ "$pre_scope_hash" != "$post_scope_hash" ]]; then
+      progress_changed=1
+      progress_status="pass"
+    elif [[ -n "$no_change_justification" ]]; then
+      progress_changed=0
+      progress_status="no_change_justified"
+      log_event "progress_gate_justified" "iteration=$iteration"
+    else
+      progress_changed=0
+      progress_status="no_change_unjustified"
+      completion_detected=0
+      completion_status="no"
+      log_event "progress_gate_block" "iteration=$iteration"
+    fi
+  else
+    progress_changed=1
+    progress_status="not_git_repo"
+  fi
+
+  if [[ "$completion_detected" -eq 1 && -n "$completion_promise" ]]; then
+    if [[ "$completion_promise_value" != "$completion_promise" ]]; then
+      completion_detected=0
+      completion_status="no"
+      log_event "completion_promise_mismatch" "expected=$completion_promise;actual=${completion_promise_value:-"(empty)"}"
+    fi
+  fi
+
   normalized_output=""
   if [[ -f "$last_message_file" ]]; then
     raw_output="$(tr -d '\r' < "$last_message_file")"
     normalized_output="$(trim_ws "$raw_output")"
   fi
 
-  if [[ -n "$completion_promise" && -n "$normalized_output" ]]; then
-    expected_output="<promise>${completion_promise}</promise>"
-
-    if [[ "$normalized_output" == "$expected_output" ]]; then
-      completion_detected=1
-      completion_status="yes"
-      log_event "promise_detected" "$expected_output"
-    fi
-  fi
-
   if [[ -n "$normalized_output" ]]; then
-    current_output_hash="$(printf '%s' "$normalized_output" | hash_text)"
+    current_output_hash="$(printf '%s' "$completion_status_value|$progress_status|$normalized_output" | hash_text)"
     if [[ -n "$last_output_hash" && "$current_output_hash" == "$last_output_hash" ]]; then
       stagnant_iterations=$((stagnant_iterations + 1))
       log_event "stagnant_output" "count=$stagnant_iterations"
@@ -978,18 +1461,18 @@ while true; do
     last_output_hash=""
   fi
 
-  refresh_auto_feedback "$codex_exit" "$validation_status" "$completion_status"
-  append_iteration_history "$codex_exit" "$validation_status" "$completion_status"
+  refresh_auto_feedback "$codex_exit" "$validation_status" "$completion_status" "$schema_parse_status" "$progress_status"
+  append_iteration_history "$codex_exit" "$validation_status" "$completion_status" "$schema_parse_status" "$progress_status"
 
-  if [[ "$completion_detected" -eq 1 && "$validation_ok" -eq 1 ]]; then
-    stop_reason="completion_promise_detected"
+  if [[ "$completion_detected" -eq 1 && "$validation_ok" -eq 1 && "$schema_parse_status" == "ok" && "$progress_status" != "no_change_unjustified" ]]; then
+    stop_reason="schema_completion_detected"
     log_event "stop" "$stop_reason"
     break
   fi
 
   if [[ "$completion_detected" -eq 1 && "$validation_ok" -eq 0 ]]; then
-    warn "Completion promise detected but validation failed; continuing loop"
-    log_event "promise_rejected" "validation_failed"
+    warn "Schema completion detected but validation failed; continuing loop"
+    log_event "completion_rejected" "validation_failed"
   fi
 
   if [[ "$max_stagnant_iterations" -gt 0 && "$stagnant_iterations" -ge "$max_stagnant_iterations" ]]; then

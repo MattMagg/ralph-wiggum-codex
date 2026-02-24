@@ -14,13 +14,15 @@ This is not a Claude plugin port that relies on `.claude-plugin` hooks. It is a 
 ## Core Capabilities
 
 - Multi-iteration implement -> validate -> refine loops
-- Strict completion contracts via `<promise>...</promise>`
+- Deterministic completion via `codex exec --output-schema`
 - Dynamic objective reloading (`--objective-file`)
 - Live steering feedback reloading (`--feedback-file`)
 - Auto corrective feedback generation on failures
 - Iteration memory (`iteration-history.md`) fed back into future iterations
 - Stagnation detection (`--max-stagnant-iterations`)
-- Resume support and single-run locking
+- Scoped progress gating (`--progress-scope`) to block no-op iterations
+- Watchdog timeouts with controlled retries (`--idle-timeout-seconds`, `--hard-timeout-seconds`, `--timeout-retries`)
+- Resume support and stale-lock recovery with metadata (`--reclaim-stale-lock`)
 
 ## Install
 
@@ -54,7 +56,7 @@ Objective: implement X with tests.
 Validation:
 - npm run lint
 - npm run test
-Completion promise: DONE
+Completion promise (compatibility mode): DONE
 Max iterations: 40
 Max stagnant iterations: 6
 ```
@@ -71,9 +73,15 @@ The skill will set up and run the loop under `.codex/ralph-loop/`.
   --completion-promise "DONE" \
   --max-iterations 40 \
   --max-stagnant-iterations 6 \
+  --progress-scope "src/" \
+  --idle-timeout-seconds 900 \
+  --hard-timeout-seconds 7200 \
+  --timeout-retries 1 \
   --validate-cmd "npm run lint" \
   --validate-cmd "npm run test"
 ```
+
+`--completion-promise` is still supported for compatibility but deprecated. Completion is accepted from schema-conformant JSON output (`status=COMPLETE`) plus passing validations.
 
 Resume:
 
@@ -89,16 +97,29 @@ Stop:
 touch /path/to/repo/.codex/ralph-loop/STOP
 ```
 
+## Final Message JSON Contract
+
+Each iteration asks Codex to emit exactly one JSON object conforming to `.codex/ralph-loop/completion-schema.json`:
+
+- `status`: `IN_PROGRESS`, `BLOCKED`, or `COMPLETE`
+- `evidence`: non-empty array of concrete command/result evidence
+- `next_step`: one highest-impact next step
+- `no_change_justification`: optional explanation when no scoped files changed
+- `completion_promise`: optional compatibility field (checked when `--completion-promise` is configured)
+
 ## Run Artifacts
 
 - `.codex/ralph-loop/state.env`
 - `.codex/ralph-loop/events.log`
+- `.codex/ralph-loop/completion-schema.json`
 - `.codex/ralph-loop/iteration-history.md`
 - `.codex/ralph-loop/feedback.md`
 - `.codex/ralph-loop/auto-feedback.md`
 - `.codex/ralph-loop/last-message.txt`
 - `.codex/ralph-loop/run-summary.md`
 - `.codex/ralph-loop/validation/`
+- `.codex/ralph-loop/codex/iteration-<n>-attempt-<m>.jsonl`
+- `.codex/ralph-loop/.lock/meta.env` (while active)
 
 ## Repo Structure
 
